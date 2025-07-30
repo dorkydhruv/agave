@@ -4,6 +4,7 @@ use {
     },
     itertools::Itertools,
     lazy_lru::LruCache,
+    ldpc::{self, LdpcCode},
     rayon::{prelude::*, ThreadPool},
     reed_solomon_erasure::{
         galois_8::ReedSolomon,
@@ -47,6 +48,13 @@ pub struct ReedSolomonCache(
     LruCacheOnce<
         (usize, usize), // number of {data,parity} shards
         Result<Arc<ReedSolomon>, reed_solomon_erasure::Error>,
+    >,
+);
+
+pub struct LdpcCache(
+    LruCacheOnce<
+        (usize, usize), // number of {data,parity} shards
+        Result<Arc<LdpcCode>, ldpc::LdpcError>,
     >,
 );
 
@@ -499,6 +507,39 @@ impl ReedSolomonCache {
 }
 
 impl Default for ReedSolomonCache {
+    fn default() -> Self {
+        Self(RwLock::new(LruCache::new(Self::CAPACITY)))
+    }
+}
+
+impl LdpcCache {
+    const CAPACITY: usize = 4 * DATA_SHREDS_PER_FEC_BLOCK;
+
+    pub(crate) fn get(
+        &self,
+        data_shards: usize,
+        parity_shards: usize,
+    ) -> Result<Arc<LdpcCode>, ldpc::LdpcError> {
+        let key = (data_shards, parity_shards);
+        // Read from the cache with a shared lock.
+        let entry = self.0.read().unwrap().get(&key).cloned();
+        // Fall back to exclusive lock if there is a cache miss.
+        let entry: Arc<OnceLock<Result<_, _>>> = entry.unwrap_or_else(|| {
+            let mut cache = self.0.write().unwrap();
+            cache.get(&key).cloned().unwrap_or_else(|| {
+                let entry = Arc::<OnceLock<Result<_, _>>>::default();
+                cache.put(key, Arc::clone(&entry));
+                entry
+            })
+        });
+        // Initialize if needed by only a single thread outside locks.
+        entry
+            .get_or_init(|| LdpcCode::new(parity_shards, data_shards + parity_shards, 0, ldpc::MakeMethod::EvenBoth, "3", false).map(Arc::new))
+            .clone()
+    }
+}
+
+impl Default for LdpcCache {
     fn default() -> Self {
         Self(RwLock::new(LruCache::new(Self::CAPACITY)))
     }

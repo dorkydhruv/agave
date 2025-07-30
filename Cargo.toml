@@ -50,6 +50,7 @@ members = [
     "lattice-hash",
     "ledger",
     "ledger-tool",
+    "ldpc",
     "local-cluster",
     "log-analyzer",
     "log-collector",
@@ -447,6 +448,7 @@ solana-keccak-hasher = "2.2.1"
 solana-keypair = "2.2.1"
 solana-last-restart-slot = "2.2.1"
 solana-lattice-hash = { path = "lattice-hash", version = "=3.0.0" }
+ldpc = { path = "ldpc", version = "=0.1.0" }
 solana-ledger = { path = "ledger", version = "=3.0.0" }
 solana-loader-v2-interface = "2.2.1"
 solana-loader-v3-interface = "5.0.0"
