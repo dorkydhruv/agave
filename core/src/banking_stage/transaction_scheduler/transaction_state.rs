@@ -8,7 +8,7 @@ use qualifier_attr::qualifiers;
 /// Newly received transactions initially have `Some(transaction)`.
 /// When a transaction is scheduled, the transaction is taken from the Option.
 /// When a transaction finishes processing it may be retryable. If it is
-/// retryable, the transaction is added back into the Option. If it si not
+/// retryable, the transaction is added back into the Option. If it is not
 /// retryable, the state is dropped.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) struct TransactionState<Tx> {
