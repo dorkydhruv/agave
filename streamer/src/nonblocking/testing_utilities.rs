@@ -1,10 +1,11 @@
 //! Contains utility functions to create server and client for test purposes.
 use {
-    super::quic::{SpawnNonBlockingServerResult, ALPN_TPU_PROTOCOL_ID},
+    super::quic::{SpawnNonBlockingServerResult, ALPN_TPU_PROTOCOL_ID, ALPN_WEBTRANSPORT},
     crate::{
         nonblocking::{
             quic::spawn_server,
             swqos::{SwQos, SwQosConfig},
+            webtransport::WebTransportSession,
         },
         quic::{QuicServerError, QuicStreamerConfig, StreamerStats, QUIC_MAX_TIMEOUT},
         streamer::StakedNodes,
@@ -69,7 +70,7 @@ where
     )
 }
 
-pub fn get_client_config(keypair: &Keypair) -> ClientConfig {
+fn build_client_config(keypair: &Keypair, alpn: &[u8]) -> ClientConfig {
     let (cert, key) = new_dummy_x509_certificate(keypair);
 
     let mut crypto = tls_client_config_builder()
@@ -77,7 +78,7 @@ pub fn get_client_config(keypair: &Keypair) -> ClientConfig {
         .expect("Failed to use client certificate");
 
     crypto.enable_early_data = true;
-    crypto.alpn_protocols = vec![ALPN_TPU_PROTOCOL_ID.to_vec()];
+    crypto.alpn_protocols = vec![alpn.to_vec()];
 
     let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
 
@@ -89,6 +90,14 @@ pub fn get_client_config(keypair: &Keypair) -> ClientConfig {
     config.transport_config(Arc::new(transport_config));
 
     config
+}
+
+pub fn get_client_config(keypair: &Keypair) -> ClientConfig {
+    build_client_config(keypair, ALPN_TPU_PROTOCOL_ID)
+}
+
+pub fn get_webtransport_client_config(keypair: &Keypair) -> ClientConfig {
+    build_client_config(keypair, ALPN_WEBTRANSPORT)
 }
 
 pub struct SpawnTestServerResult {
@@ -174,6 +183,35 @@ pub async fn make_client_endpoint(
         .expect("Endpoint configuration should be correct")
         .await
         .expect("Test server should be already listening on 'localhost'")
+}
+
+/// Create a WebTransport client connection
+pub async fn make_webtransport_client_session(
+    addr: &SocketAddr,
+    client_keypair: Option<&Keypair>,
+) -> WebTransportSession {
+    let client_socket = bind_to_localhost_unique().expect("should bind - client");
+    let mut endpoint = quinn::Endpoint::new(
+        EndpointConfig::default(),
+        None,
+        client_socket,
+        Arc::new(TokioRuntime),
+    )
+    .unwrap();
+    let default_keypair = Keypair::new();
+    endpoint.set_default_client_config(get_webtransport_client_config(
+        client_keypair.unwrap_or(&default_keypair),
+    ));
+    let conn = endpoint
+        .connect(*addr, "localhost")
+        .expect("Endpoint configuration should be correct")
+        .await
+        .expect("Test server should be already listening on 'localhost'");
+
+    // Perform full WebTransport handshake using client-side connect
+    WebTransportSession::connect(conn, "/")
+        .await
+        .expect("WebTransport handshake should succeed")
 }
 
 pub async fn check_multiple_streams(

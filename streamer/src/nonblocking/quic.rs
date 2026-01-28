@@ -3,6 +3,7 @@ use {
         nonblocking::{
             connection_rate_limiter::ConnectionRateLimiter,
             qos::{ConnectionContext, OpaqueStreamerCounter, QosController},
+            webtransport::{self, WebTransportSession},
         },
         quic::{configure_server, QuicServerError, QuicStreamerConfig, StreamerStats},
         streamer::StakedNodes,
@@ -11,7 +12,7 @@ use {
     crossbeam_channel::{Sender, TrySendError},
     futures::{stream::FuturesUnordered, Future, StreamExt as _},
     indexmap::map::{Entry, IndexMap},
-    quinn::{Accept, Connecting, Connection, Endpoint, EndpointConfig, TokioRuntime},
+    quinn::{Accept, Connecting, Connection, Endpoint, EndpointConfig, RecvStream, TokioRuntime},
     rand::{rng, Rng},
     smallvec::SmallVec,
     solana_keypair::Keypair,
@@ -54,6 +55,7 @@ use {
 pub const DEFAULT_WAIT_FOR_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
+pub const ALPN_WEBTRANSPORT: &[u8] = b"h3";
 
 const CONNECTION_CLOSE_CODE_DROPPED_ENTRY: u32 = 1;
 const CONNECTION_CLOSE_REASON_DROPPED_ENTRY: &[u8] = b"dropped";
@@ -397,6 +399,16 @@ pub fn get_remote_pubkey(connection: &Connection) -> Option<Pubkey> {
         .and_then(get_pubkey_from_tls_certificate)
 }
 
+/// Get the negotiated ALPN protocol from a connection's handshake data.
+pub(crate) fn get_negotiated_alpn(connection: &Connection) -> Option<Vec<u8>> {
+    // Quinn stores handshake data after the TLS handshake completes
+    // For rustls, this is quinn::crypto::rustls::HandshakeData
+    connection
+        .handshake_data()?
+        .downcast_ref::<quinn::crypto::rustls::HandshakeData>()
+        .and_then(|hd| hd.protocol.as_ref().map(|alpn| alpn.to_vec()))
+}
+
 pub fn get_connection_stake(
     connection: &Connection,
     staked_nodes: &RwLock<StakedNodes>,
@@ -503,16 +515,28 @@ async fn setup_connection<Q, C>(
                     )
                     .await
                 {
-                    tasks.spawn(handle_connection(
-                        packet_sender.clone(),
-                        from,
-                        new_connection,
-                        stats,
-                        server_params.wait_for_chunk_timeout,
-                        conn_context.clone(),
-                        qos,
-                        cancel_connection,
-                    ));
+                    match get_negotiated_alpn(&new_connection).as_deref() {
+                        Some(ALPN_WEBTRANSPORT) => tasks.spawn(handle_webtransport_connection(
+                            packet_sender.clone(),
+                            from,
+                            new_connection,
+                            stats,
+                            server_params.wait_for_chunk_timeout,
+                            conn_context.clone(),
+                            qos,
+                            cancel_connection,
+                        )),
+                        Some(ALPN_TPU_PROTOCOL_ID) | _ => tasks.spawn(handle_connection(
+                            packet_sender.clone(),
+                            from,
+                            new_connection,
+                            stats,
+                            server_params.wait_for_chunk_timeout,
+                            conn_context.clone(),
+                            qos,
+                            cancel_connection,
+                        )),
+                    };
                 }
             }
             Err(e) => {
@@ -593,33 +617,70 @@ fn track_streamer_fetch_packet_performance(
         .fetch_add(measure.as_us(), Ordering::Relaxed);
 }
 
-async fn handle_connection<Q, C>(
+/// Trait for accepting unidirectional streams from either raw QUIC or WebTransport.
+trait StreamSource: Send {
+    fn accept_uni(
+        &self,
+    ) -> impl std::future::Future<Output = Result<RecvStream, quinn::ConnectionError>> + Send;
+
+    fn close(&self, code: u32, reason: &[u8]);
+
+    fn connection(&self) -> &Connection;
+}
+
+impl StreamSource for Connection {
+    async fn accept_uni(&self) -> Result<RecvStream, quinn::ConnectionError> {
+        Connection::accept_uni(self).await
+    }
+
+    fn close(&self, code: u32, reason: &[u8]) {
+        Connection::close(self, quinn::VarInt::from_u32(code), reason);
+    }
+
+    fn connection(&self) -> &Connection {
+        self
+    }
+}
+
+impl StreamSource for WebTransportSession {
+    async fn accept_uni(&self) -> Result<RecvStream, quinn::ConnectionError> {
+        WebTransportSession::accept_uni(self)
+            .await
+            .map_err(|e| match e {
+                webtransport::WebTransportError::Connection(e) => e,
+                _ => quinn::ConnectionError::LocallyClosed,
+            })
+    }
+
+    fn close(&self, code: u32, reason: &[u8]) {
+        WebTransportSession::close(self, code, reason);
+    }
+
+    fn connection(&self) -> &Connection {
+        WebTransportSession::connection(self)
+    }
+}
+
+async fn handle_streams<Q, C, S>(
     packet_sender: Sender<PacketBatch>,
     remote_address: SocketAddr,
-    connection: Connection,
+    source: S,
     stats: Arc<StreamerStats>,
     wait_for_chunk_timeout: Duration,
     context: C,
     qos: Arc<Q>,
     cancel: CancellationToken,
+    is_webtransport: bool,
 ) where
     Q: QosController<C> + Send + Sync + 'static,
     C: ConnectionContext + Send + Sync + 'static,
+    S: StreamSource,
 {
     let peer_type = context.peer_type();
-    debug!(
-        "quic new connection {} streams: {} connections: {}",
-        remote_address,
-        stats.active_streams.load(Ordering::Relaxed),
-        stats.total_connections.load(Ordering::Relaxed),
-    );
-    stats.total_connections.fetch_add(1, Ordering::Relaxed);
 
     'conn: loop {
-        // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
-        // the connection task.
         let mut stream = select! {
-            stream = connection.accept_uni() => match stream {
+            stream = source.accept_uni() => match stream {
                 Ok(stream) => stream,
                 Err(e) => {
                     debug!("stream error: {e:?}");
@@ -633,10 +694,17 @@ async fn handle_connection<Q, C>(
         qos.on_stream_accepted(&context);
         stats.active_streams.fetch_add(1, Ordering::Relaxed);
         stats.total_new_streams.fetch_add(1, Ordering::Relaxed);
+        if is_webtransport {
+            stats
+                .webtransport_streams_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         let mut meta = Meta::default();
         meta.set_socket_addr(&remote_address);
-        meta.set_from_staked_node(matches!(peer_type, ConnectionPeerType::Staked(_)));
+        meta.set_from_staked_node(
+            !is_webtransport && matches!(peer_type, ConnectionPeerType::Staked(_)),
+        );
         if let Some(pubkey) = context.remote_pubkey() {
             meta.set_remote_pubkey(pubkey);
         }
@@ -701,7 +769,7 @@ async fn handle_connection<Q, C>(
                 Ok(StreamState::Receiving) => {}
                 Err(_) => {
                     // Disconnect peers that send invalid streams.
-                    connection.close(
+                    source.close(
                         CONNECTION_CLOSE_CODE_INVALID_STREAM.into(),
                         CONNECTION_CLOSE_REASON_INVALID_STREAM,
                     );
@@ -716,7 +784,9 @@ async fn handle_connection<Q, C>(
         qos.on_stream_closed(&context);
     }
 
-    let removed_connection_count = qos.remove_connection(&context, connection).await;
+    let removed_connection_count = qos
+        .remove_connection(&context, source.connection().clone())
+        .await;
     if removed_connection_count > 0 {
         stats
             .connection_removed
@@ -726,6 +796,129 @@ async fn handle_connection<Q, C>(
             .connection_remove_failed
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+async fn handle_connection<Q, C>(
+    packet_sender: Sender<PacketBatch>,
+    remote_address: SocketAddr,
+    connection: Connection,
+    stats: Arc<StreamerStats>,
+    wait_for_chunk_timeout: Duration,
+    context: C,
+    qos: Arc<Q>,
+    cancel: CancellationToken,
+) where
+    Q: QosController<C> + Send + Sync + 'static,
+    C: ConnectionContext + Send + Sync + 'static,
+{
+    debug!(
+        "quic new connection {} streams: {} connections: {}",
+        remote_address,
+        stats.active_streams.load(Ordering::Relaxed),
+        stats.total_connections.load(Ordering::Relaxed),
+    );
+    stats.total_connections.fetch_add(1, Ordering::Relaxed);
+
+    handle_streams(
+        packet_sender,
+        remote_address,
+        connection,
+        stats.clone(),
+        wait_for_chunk_timeout,
+        context,
+        qos,
+        cancel,
+        false,
+    )
+    .await;
+
+    stats.total_connections.fetch_sub(1, Ordering::Relaxed);
+}
+
+const WEBTRANSPORT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Handle a WebTransport connection from a browser client.
+async fn handle_webtransport_connection<Q, C>(
+    packet_sender: Sender<PacketBatch>,
+    remote_address: SocketAddr,
+    connection: Connection,
+    stats: Arc<StreamerStats>,
+    wait_for_chunk_timeout: Duration,
+    context: C,
+    qos: Arc<Q>,
+    cancel: CancellationToken,
+) where
+    Q: QosController<C> + Send + Sync + 'static,
+    C: ConnectionContext + Send + Sync + 'static,
+{
+    debug!(
+        "webtransport new connection {} streams: {} connections: {}",
+        remote_address,
+        stats.active_streams.load(Ordering::Relaxed),
+        stats.total_connections.load(Ordering::Relaxed),
+    );
+    stats.total_connections.fetch_add(1, Ordering::Relaxed);
+
+    // Perform WebTransport handshake (HTTP/3 SETTINGS + CONNECT)
+    let session = match timeout(
+        WEBTRANSPORT_HANDSHAKE_TIMEOUT,
+        WebTransportSession::accept(connection.clone()),
+    )
+    .await
+    {
+        Ok(Ok(session)) => {
+            stats
+                .webtransport_sessions_established
+                .fetch_add(1, Ordering::Relaxed);
+            session
+        }
+        Ok(Err(e)) => {
+            debug!("WebTransport handshake failed: {e:?}");
+            stats
+                .webtransport_handshake_failed
+                .fetch_add(1, Ordering::Relaxed);
+            let removed_connection_count = qos.remove_connection(&context, connection).await;
+            if removed_connection_count > 0 {
+                stats
+                    .connection_removed
+                    .fetch_add(removed_connection_count, Ordering::Relaxed);
+            }
+            stats.total_connections.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        Err(_) => {
+            debug!("WebTransport handshake timed out");
+            stats
+                .webtransport_handshake_failed
+                .fetch_add(1, Ordering::Relaxed);
+            connection.close(
+                CONNECTION_CLOSE_CODE_DISALLOWED.into(),
+                b"webtransport_handshake_timeout",
+            );
+            let removed_connection_count = qos.remove_connection(&context, connection).await;
+            if removed_connection_count > 0 {
+                stats
+                    .connection_removed
+                    .fetch_add(removed_connection_count, Ordering::Relaxed);
+            }
+            stats.total_connections.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    handle_streams(
+        packet_sender,
+        remote_address,
+        session,
+        stats.clone(),
+        wait_for_chunk_timeout,
+        context,
+        qos,
+        cancel,
+        true,
+    )
+    .await;
+
     stats.total_connections.fetch_sub(1, Ordering::Relaxed);
 }
 
@@ -1120,7 +1313,8 @@ pub mod test {
             qos::NullStreamerCounter,
             swqos::SwQosConfig,
             testing_utilities::{
-                check_multiple_streams, get_client_config, make_client_endpoint, setup_quic_server,
+                check_multiple_streams, get_client_config, make_client_endpoint,
+                make_webtransport_client_session, setup_quic_server,
                 spawn_stake_weighted_qos_server, SpawnTestServerResult,
             },
         },
@@ -2020,6 +2214,131 @@ pub mod test {
             _ => panic!("unexpected close"),
         }
         assert_eq!(stats.invalid_stream_size.load(Ordering::Relaxed), 1);
+        cancel.cancel();
+        join_handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_webtransport_send_data() {
+        agave_logger::setup();
+        let SpawnTestServerResult {
+            join_handle,
+            receiver,
+            server_address,
+            stats,
+            cancel,
+        } = setup_quic_server(
+            None,
+            QuicStreamerConfig::default_for_tests(),
+            SwQosConfig::default(),
+        );
+
+        let session = make_webtransport_client_session(&server_address, None).await;
+
+        // Session ID and remote address should be valid
+        assert!(session.session_id() < u64::MAX);
+        assert_eq!(session.remote_address(), server_address);
+
+        // Send data
+        let mut stream = session.open_uni().await.expect("should open stream");
+        let tx_data = vec![42u8; 100];
+        stream.write_all(&tx_data).await.expect("should write data");
+        stream.finish().expect("should finish stream");
+
+        // Wait for packet
+        let mut received = false;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if let Ok(batch) = receiver.try_recv() {
+                for packet in batch.iter() {
+                    if packet.meta().size == tx_data.len() {
+                        received = true;
+                        break;
+                    }
+                }
+                if received {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(received);
+        assert_eq!(
+            stats
+                .webtransport_sessions_established
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats.webtransport_streams_received.load(Ordering::Relaxed),
+            1
+        );
+
+        session.close(0, b"done");
+        cancel.cancel();
+        join_handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_quic_and_webtransport_mixed() {
+        agave_logger::setup();
+        let SpawnTestServerResult {
+            join_handle,
+            receiver,
+            server_address,
+            stats,
+            cancel,
+        } = setup_quic_server(
+            None,
+            QuicStreamerConfig::default_for_tests(),
+            SwQosConfig::default(),
+        );
+
+        // Create connections for both protocols
+        let raw_conn = make_client_endpoint(&server_address, None).await;
+        let wt_session = make_webtransport_client_session(&server_address, None).await;
+
+        // Send packets on both
+        let raw_size = 100;
+        let wt_size = 80;
+
+        let mut raw_stream = raw_conn.open_uni().await.unwrap();
+        raw_stream.write_all(&vec![1u8; raw_size]).await.unwrap();
+        raw_stream.finish().unwrap();
+
+        let mut wt_stream = wt_session.open_uni().await.unwrap();
+        wt_stream.write_all(&vec![2u8; wt_size]).await.unwrap();
+        wt_stream.finish().unwrap();
+
+        // Wait for both packets
+        let mut raw_received = false;
+        let mut wt_received = false;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) && (!raw_received || !wt_received) {
+            if let Ok(batch) = receiver.try_recv() {
+                for p in batch.iter() {
+                    if p.meta().size == raw_size {
+                        raw_received = true;
+                    }
+                    if p.meta().size == wt_size {
+                        wt_received = true;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(raw_received);
+        assert!(wt_received);
+        assert_eq!(
+            stats
+                .webtransport_sessions_established
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        wt_session.close(0, b"done");
         cancel.cancel();
         join_handle.await.unwrap();
     }

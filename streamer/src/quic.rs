@@ -2,7 +2,7 @@ use {
     crate::{
         nonblocking::{
             qos::{ConnectionContext, QosController},
-            quic::{ALPN_TPU_PROTOCOL_ID, DEFAULT_WAIT_FOR_CHUNK_TIMEOUT},
+            quic::{ALPN_TPU_PROTOCOL_ID, ALPN_WEBTRANSPORT, DEFAULT_WAIT_FOR_CHUNK_TIMEOUT},
             simple_qos::{SimpleQos, SimpleQosConfig},
             swqos::{SwQos, SwQosConfig},
         },
@@ -98,7 +98,8 @@ pub(crate) fn configure_server(
 
     let mut server_tls_config =
         tls_server_config_builder().with_single_cert(vec![cert], priv_key)?;
-    server_tls_config.alpn_protocols = vec![ALPN_TPU_PROTOCOL_ID.to_vec()];
+    server_tls_config.alpn_protocols =
+        vec![ALPN_TPU_PROTOCOL_ID.to_vec(), ALPN_WEBTRANSPORT.to_vec()];
     server_tls_config.key_log = Arc::new(KeyLogFile::new());
     let quic_server_config = QuicServerConfig::try_from(server_tls_config)?;
 
@@ -121,8 +122,9 @@ pub(crate) fn configure_server(
     let timeout = IdleTimeout::try_from(QUIC_MAX_TIMEOUT).unwrap();
     config.max_idle_timeout(Some(timeout));
 
-    // disable bidi & datagrams
-    config.max_concurrent_bidi_streams(0u32.into());
+    // Allow exactly 1 bidirectional stream for WebTransport handshake (CONNECT request/response).
+    // Data is still sent via unidirectional streams.
+    config.max_concurrent_bidi_streams(1u32.into());
     config.datagram_receive_buffer_size(None);
 
     // Disable GSO. The server only accepts inbound unidirectional streams initiated by clients,
@@ -230,6 +232,10 @@ pub struct StreamerStats {
     pub(crate) outstanding_incoming_connection_attempts: AtomicUsize,
     pub(crate) total_incoming_connection_attempts: AtomicUsize,
     pub(crate) quic_endpoints_count: AtomicUsize,
+    // WebTransport connection stats
+    pub(crate) webtransport_sessions_established: AtomicUsize,
+    pub(crate) webtransport_handshake_failed: AtomicUsize,
+    pub(crate) webtransport_streams_received: AtomicUsize,
 }
 
 impl StreamerStats {
